@@ -1,0 +1,101 @@
+name: Drift Detection
+
+# Real scan against an AWS account. Runs only on demand and only when the
+# AWS_DRIFT_ROLE_ARN repository variable is set (OIDC — no stored access keys).
+# To schedule it, add:  schedule: [{cron: "0 */6 * * *"}]
+on:
+  workflow_dispatch:
+    inputs:
+      remediate:
+        description: "Auto-remediate safe findings?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write        # OIDC token for AWS
+  pull-requests: write
+
+jobs:
+  drift-scan:
+    name: Infrastructure Drift Scan
+    runs-on: ubuntu-latest
+    if: ${{ vars.AWS_DRIFT_ROLE_ARN != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DRIFT_ROLE_ARN }}
+          aws-region:     eu-west-1
+
+      - name: Run drift scan (JSON)
+        id: scan
+        run: |
+          python drift_detect.py scan \
+            --region eu-west-1 \
+            --output drift-report.json \
+            --format json \
+            ${{ github.event.inputs.remediate == 'true' && '--remediate' || '' }} \
+            --fail-on-critical
+        continue-on-error: true
+
+      - name: Generate HTML report
+        run: |
+          python drift_detect.py scan \
+            --region eu-west-1 \
+            --output drift-report.html \
+            --format html
+        continue-on-error: true
+
+      - name: Upload reports as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-reports-${{ github.run_id }}
+          path: |
+            drift-report.json
+            drift-report.html
+          retention-days: 30
+
+      - name: Post summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = "No drift report found.";
+            try {
+              const report = JSON.parse(fs.readFileSync('drift-report.json', 'utf8'));
+              const s = report.summary;
+              summary = `## Infrastructure Drift Scan Results\n\n` +
+                `| | Count |\n|---|---|\n` +
+                `| 🔴 Critical | ${s.critical} |\n` +
+                `| 🟡 Warning  | ${s.warning}  |\n` +
+                `| 🔵 Info     | ${s.info}     |\n` +
+                `| ✅ Remediated | ${s.remediated} |\n\n` +
+                `Account: \`${report.account_id}\` | Region: \`${report.region}\``;
+            } catch(e) { summary = "Could not parse drift report: " + e; }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+      - name: Fail if critical findings
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "Critical drift findings detected. Review the report artifact."
+          exit 1
